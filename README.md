@@ -59,9 +59,37 @@ downstream and echoes back the truth.
 
 ## Status
 
-Pre-implementation. Full spec in [`docs/spec.md`](docs/spec.md), wire protocol in
-[`docs/protocol.md`](docs/protocol.md), schema in
-[`server/migrations/0001_init.sql`](server/migrations/0001_init.sql).
+Core implemented and tested; load generator and clients (Android/iOS) pending; M0
+spikes need hardware. Built so far:
+
+- `core/compute` — histogram, stats, verdict (pure, 93%+ coverage)
+- `core/protocol` — wire format + return-routability handshake
+- `core/clock`, `core/net` — injectable time + I/O seams, plus a loopback simulator
+- `core/engine` — the phase sequence → verdict, tested across pass/fail/inconclusive
+- `core/net` real UDP socket (Linux) with `IP_TOS`/`IP_RECVTOS` marking
+- `server/` + `cli/` binaries, validated end to end over real UDP (marking survives)
+
+Full spec in [`docs/spec.md`](docs/spec.md), M0 plan in [`docs/m0-spec.md`](docs/m0-spec.md),
+architecture and required practices in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) /
+[`docs/ENGINEERING.md`](docs/ENGINEERING.md).
+
+## Build & run
+
+Requires Go (Linux for the socket layer). The measurement core and simulator are
+cross-platform; the real UDP server/CLI use `IP_TOS`/`IP_RECVTOS` and are Linux-only.
+
+```
+make ci                 # gofmt, vet, import-boundary, tests
+go build ./...
+
+# end to end over localhost:
+go run ./server/cmd/qoe-server -addr 127.0.0.1:7700 -secret <secret> &
+go run ./cli/cmd/qoe-cli -server 127.0.0.1:7700
+```
+
+The CLI today is a probe-level diagnostic (handshake + marked probe bursts →
+marking survival + working-latency percentiles). Full pass/fail runs arrive with
+the load generator and the M0-calibrated thresholds.
 
 ## Milestones
 

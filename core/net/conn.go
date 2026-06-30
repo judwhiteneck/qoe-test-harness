@@ -32,6 +32,7 @@ type Probe struct {
 // so the client can measure marking survival and CE marking end to end.
 type Echo struct {
 	Seq          uint64
+	SentAt       time.Time // original client send time, echoed back (for per-probe RTT)
 	RecvAt       time.Time // client receive time (for RTT)
 	ServerRecvAt time.Time // server receive time (for relative one-way cross-check)
 	TOSObserved  Marking

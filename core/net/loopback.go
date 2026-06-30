@@ -65,6 +65,7 @@ func (l *Loopback) SendProbe(p Probe) error {
 	}
 	l.pending = append(l.pending, Echo{
 		Seq:          p.Seq,
+		SentAt:       p.SentAt,
 		RecvAt:       p.SentAt.Add(delay),
 		ServerRecvAt: p.SentAt.Add(delay / 2),
 		TOSObserved:  tos,

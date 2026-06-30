@@ -80,7 +80,7 @@ func (e *Engine) Run() (compute.Result, error) {
 	c.Load.Stop()
 
 	// Phase 1: idle baseline -> base_rtt floor.
-	baseSamples, _, _, err := e.batch(cnet.NotECT, c.BaselineProbes)
+	baseSamples, _, _, err := BatchProbe(c.Clock, c.Conn, cnet.NotECT, c.BaselineProbes)
 	if err != nil {
 		return compute.Result{}, err
 	}
@@ -136,26 +136,27 @@ func (e *Engine) Run() (compute.Result, error) {
 	return compute.Evaluate(in, c.Thresholds), nil
 }
 
-// batch sends n probes at a single instant and drains all echoes, returning RTT
-// samples (ms), marking survival, and CE rate.
-func (e *Engine) batch(marking cnet.Marking, n int) (rttsMs []float64, survival, ce float64, err error) {
-	start := e.cfg.Clock.Now()
+// BatchProbe sends n probes of the given marking through conn and drains all
+// echoes, returning RTT samples (ms), LL marking survival, and CE rate. Each
+// probe is timestamped at send and matched to the send time the echo carries
+// back, so RTT needs no clock sync. Exported for diagnostic clients (e.g. the CLI).
+func BatchProbe(clk clock.Clock, conn cnet.PacketConn, marking cnet.Marking, n int) (rttsMs []float64, survival, ce float64, err error) {
 	for i := 0; i < n; i++ {
-		p := cnet.Probe{Seq: uint64(i + 1), SentAt: start, Marking: marking}
-		if err = e.cfg.Conn.SendProbe(p); err != nil {
+		p := cnet.Probe{Seq: uint64(i + 1), SentAt: clk.Now(), Marking: marking}
+		if err = conn.SendProbe(p); err != nil {
 			return nil, 0, 0, err
 		}
 	}
 	var survived, total, ceCount int
 	for {
-		echo, rerr := e.cfg.Conn.RecvEcho()
+		echo, rerr := conn.RecvEcho()
 		if rerr == cnet.ErrNoEcho {
 			break
 		}
 		if rerr != nil {
 			return nil, 0, 0, rerr
 		}
-		rttsMs = append(rttsMs, float64(echo.RecvAt.Sub(start).Nanoseconds())/1e6)
+		rttsMs = append(rttsMs, float64(echo.RecvAt.Sub(echo.SentAt).Nanoseconds())/1e6)
 		total++
 		if markingSurvived(marking, echo.TOSObserved) {
 			survived++
@@ -171,9 +172,9 @@ func (e *Engine) batch(marking cnet.Marking, n int) (rttsMs []float64, survival,
 	return rttsMs, survival, ce, nil
 }
 
-// histBatch is batch + a working-delta histogram over baseRTT.
+// histBatch is BatchProbe + a working-delta histogram over baseRTT.
 func (e *Engine) histBatch(marking cnet.Marking, n int, baseRTT float64) (*compute.Histogram, float64, float64, error) {
-	samples, survival, ce, err := e.batch(marking, n)
+	samples, survival, ce, err := BatchProbe(e.cfg.Clock, e.cfg.Conn, marking, n)
 	if err != nil {
 		return nil, 0, 0, err
 	}
