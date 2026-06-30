@@ -32,6 +32,7 @@ jobs:
         run: |
           pkgs="./core/compute/..."
           [ -d core/protocol ] && pkgs="$pkgs ./core/protocol/..."
+          [ -d core/report ] && pkgs="$pkgs ./core/report/..."
           go test -covermode=atomic -coverprofile=pure.out $pkgs
           pct=$(go tool cover -func=pure.out | awk '/^total:/{gsub("%","",$3); print $3}')
           echo "pure-package coverage: ${pct}%"

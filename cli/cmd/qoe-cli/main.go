@@ -8,10 +8,12 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"time"
 
@@ -19,6 +21,7 @@ import (
 	"github.com/judwhiteneck/qoe-test-harness/core/compute"
 	"github.com/judwhiteneck/qoe-test-harness/core/engine"
 	cnet "github.com/judwhiteneck/qoe-test-harness/core/net"
+	"github.com/judwhiteneck/qoe-test-harness/core/report"
 )
 
 func main() {
@@ -30,6 +33,9 @@ func main() {
 	downTier := flag.Int("down-tier-mbps", 500, "provisioned downstream tier, Mbps (used by -run)")
 	upTier := flag.Int("up-tier-mbps", 50, "provisioned upstream tier, Mbps (used by -run)")
 	jsonOut := flag.Bool("json", false, "with -run, print the Result as JSON")
+	submitURL := flag.String("submit", "", "with -run, POST the full RunReport to this dashboard ingest URL")
+	isp := flag.String("isp", "", "cohort tag: ISP name (recorded in the report)")
+	region := flag.String("region", "", "cohort tag: region (recorded in the report)")
 	flag.Parse()
 	if *serverAddr == "" {
 		log.Fatal("--server is required")
@@ -38,7 +44,15 @@ func main() {
 	clk := clock.System{}
 
 	if *runFull {
-		runValidation(clk, *serverAddr, uint64(*downTier)*1_000_000, uint64(*upTier)*1_000_000, *jsonOut)
+		runValidation(clk, runOpts{
+			serverAddr: *serverAddr,
+			downBps:    uint64(*downTier) * 1_000_000,
+			upBps:      uint64(*upTier) * 1_000_000,
+			asJSON:     *jsonOut,
+			submitURL:  *submitURL,
+			isp:        *isp,
+			region:     *region,
+		})
 		return
 	}
 	conn, err := cnet.DialUDP(clk, *serverAddr)
@@ -137,12 +151,21 @@ func main() {
 	fmt.Printf("  classic working-delta p50/p99: %.2f / %.2f ms\n", clHist.Quantile(0.5), clHist.Quantile(0.99))
 }
 
-// runValidation wires real sockets into the full engine phase sequence and prints
-// the single-source-of-truth Result. The engine is seam-injected (see
-// docs/ARCHITECTURE.md); this is the composition root that hands it production
-// I/O: a marked-UDP probe socket and the cookie-gated downstream load controller.
-func runValidation(clk clock.Clock, serverAddr string, downBps, upBps uint64, asJSON bool) {
-	conn, err := cnet.DialUDP(clk, serverAddr)
+type runOpts struct {
+	serverAddr     string
+	downBps, upBps uint64
+	asJSON         bool
+	submitURL      string
+	isp, region    string
+}
+
+// runValidation wires real sockets into the full engine phase sequence, prints
+// the single-source-of-truth Result, and optionally submits the full RunReport to
+// the dashboard. The engine is seam-injected (see docs/ARCHITECTURE.md); this is
+// the composition root that hands it production I/O: a marked-UDP probe socket and
+// the cookie-gated downstream load controller.
+func runValidation(clk clock.Clock, o runOpts) {
+	conn, err := cnet.DialUDP(clk, o.serverAddr)
 	if err != nil {
 		log.Fatalf("dial probe socket: %v", err)
 	}
@@ -151,41 +174,88 @@ func runValidation(clk clock.Clock, serverAddr string, downBps, upBps uint64, as
 		log.Printf("probe handshake failed (continuing): %v", err)
 	}
 
-	down, err := cnet.DialUDPDownLoad(clk, serverAddr, 2)
+	down, err := cnet.DialUDPDownLoad(clk, o.serverAddr, 2)
 	if err != nil {
 		log.Fatalf("dial downstream load: %v", err)
 	}
 	defer down.Close()
 
+	startedAt := time.Now()
 	eng := engine.New(engine.Config{
 		Clock:              clk,
 		Conn:               conn,
 		Load:               down,
-		ProvisionedDownBps: downBps,
-		ProvisionedUpBps:   upBps,
+		ProvisionedDownBps: o.downBps,
+		ProvisionedUpBps:   o.upBps,
 	})
-	res, err := eng.Run()
+	rep, err := eng.RunFull()
 	if err != nil {
 		log.Fatalf("run: %v", err)
 	}
 
-	if asJSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(res); err != nil {
-			log.Fatalf("encode: %v", err)
-		}
-		return
+	rr := report.RunReport{
+		Schema: report.SchemaVersion,
+		Meta: report.Meta{
+			RunID:              fmt.Sprintf("cli-%d", startedAt.UnixNano()),
+			StartedAtUnixMs:    startedAt.UnixMilli(),
+			ISP:                o.isp,
+			Region:             o.region,
+			DeviceClass:        "cli",
+			ProvisionedDownBps: o.downBps,
+			ProvisionedUpBps:   o.upBps,
+		},
+		Result: rep.Result,
+		Telemetry: report.Telemetry{
+			BaseRTTms:            rep.BaseRTTms,
+			MarkingSurvival:      rep.MarkingSurvival,
+			CapacityAchievedBps:  rep.CapacityAchievedBps,
+			OvershootAchievedBps: rep.OvershootAchievedBps,
+			DownLL:               rep.DownLL,
+			DownClassic:          rep.DownClassic,
+		},
 	}
 
-	fmt.Printf("qoe-cli validation run\n")
-	fmt.Printf("  server:   %s\n", serverAddr)
-	fmt.Printf("  tiers:    %d down / %d up Mbps\n", downBps/1_000_000, upBps/1_000_000)
-	fmt.Printf("  VERDICT:  %s\n", res.Verdict)
-	for _, sr := range res.SubResults {
-		fmt.Printf("    - %-16s %-12s %s\n", sr.Name, sr.Status, sr.Detail)
+	if o.asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(rr); err != nil {
+			log.Fatalf("encode: %v", err)
+		}
+	} else {
+		fmt.Printf("qoe-cli validation run\n")
+		fmt.Printf("  server:   %s\n", o.serverAddr)
+		fmt.Printf("  tiers:    %d down / %d up Mbps\n", o.downBps/1_000_000, o.upBps/1_000_000)
+		fmt.Printf("  base RTT: %.2f ms · marking survival: %.1f%%\n", rep.BaseRTTms, rep.MarkingSurvival*100)
+		fmt.Printf("  VERDICT:  %s\n", rep.Result.Verdict)
+		for _, sr := range rep.Result.SubResults {
+			fmt.Printf("    - %-16s %-12s %s\n", sr.Name, sr.Status, sr.Detail)
+		}
+		for _, cv := range rep.Result.Caveats {
+			fmt.Printf("    caveat: %s\n", cv)
+		}
 	}
-	for _, cv := range res.Caveats {
-		fmt.Printf("    caveat: %s\n", cv)
+
+	if o.submitURL != "" {
+		if err := submit(o.submitURL, rr); err != nil {
+			log.Fatalf("submit: %v", err)
+		}
+		fmt.Printf("  submitted run %s to %s\n", rr.Meta.RunID, o.submitURL)
 	}
+}
+
+// submit POSTs the report JSON to the dashboard ingest endpoint.
+func submit(url string, rr report.RunReport) error {
+	body, err := json.Marshal(rr)
+	if err != nil {
+		return err
+	}
+	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("ingest returned %s", resp.Status)
+	}
+	return nil
 }

@@ -77,6 +77,14 @@ hardware. Built so far:
   loopback: paced rate ≈ achieved in both directions, probes run concurrently
 - `server/` + `cli/` binaries, validated end to end over real UDP (marking
   survives; `qoe-cli -load-mbps N -down-mbps M` probes under live bidirectional load)
+- `core/report` — the submitted/stored run record (verdict + mergeable
+  histograms + cohort metadata), pure and JSON round-tripped
+- `storage` — `Store` interface with an in-memory impl (tested) and a Postgres
+  adapter that takes an injected `*sql.DB` (stdlib only; `storage/schema.sql`)
+- `dashboard` — engineer view: `/ingest` (POST report), `/api/cdf` (cohort-merged
+  LL-vs-classic CDF), `/api/runs` (filtered table), `/` (self-contained HTML
+  overlay); tested with `httptest`. `qoe-cli -run -submit URL` posts a report end
+  to end
 
 Full spec in [`docs/spec.md`](docs/spec.md), M0 plan in [`docs/m0-spec.md`](docs/m0-spec.md),
 architecture and required practices in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) /
@@ -96,6 +104,12 @@ go run ./server/cmd/qoe-server -addr 127.0.0.1:7700 -secret <secret> &
 go run ./cli/cmd/qoe-cli -server 127.0.0.1:7700                              # idle probes
 go run ./cli/cmd/qoe-cli -server 127.0.0.1:7700 -load-mbps 80 -down-mbps 120 # probes under load
 go run ./cli/cmd/qoe-cli -server 127.0.0.1:7700 -run -down-tier-mbps 500     # full verdict
+
+# engineer dashboard (in-memory store) + submit a run to it:
+go run ./dashboard/cmd/qoe-dashboard -addr :8080 &
+go run ./cli/cmd/qoe-cli -server 127.0.0.1:7700 -run -isp Acme -region west \
+  -submit http://127.0.0.1:8080/ingest
+# then open http://127.0.0.1:8080 for the LL-vs-classic CDF overlay
 ```
 
 The CLI has two modes. The default is a probe-level diagnostic: handshake +

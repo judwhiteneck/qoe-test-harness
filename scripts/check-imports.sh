@@ -26,6 +26,7 @@ check() {
 
 check core/compute
 check core/protocol
+check core/report
 
 if [ "$status" -eq 0 ]; then
   echo "import boundaries OK"

@@ -84,24 +84,43 @@ func New(cfg Config) *Engine {
 	return &Engine{cfg: cfg}
 }
 
+// Report is a run's verdict plus the telemetry behind it, for submission to the
+// engineer view. Run returns just the verdict; RunFull returns this.
+type Report struct {
+	Result               compute.Result
+	BaseRTTms            float64
+	MarkingSurvival      float64
+	CapacityAchievedBps  uint64
+	OvershootAchievedBps uint64
+	DownLL               *compute.Histogram
+	DownClassic          *compute.Histogram
+}
+
 // Run executes the phase sequence and returns the verdict. Validity gates
 // (capacity, standing queue) are computed here and handed to compute.Evaluate,
 // which applies inconclusive-precedence.
 func (e *Engine) Run() (compute.Result, error) {
+	rep, err := e.RunFull()
+	return rep.Result, err
+}
+
+// RunFull executes the phase sequence and returns the verdict together with the
+// telemetry behind it (mergeable histograms + scalars).
+func (e *Engine) RunFull() (Report, error) {
 	c := e.cfg
 	c.Load.Stop()
 
 	// Phase 1: idle baseline -> base_rtt floor.
 	baseSamples, _, _, err := BatchProbe(c.Clock, c.Conn, cnet.NotECT, c.BaselineProbes)
 	if err != nil {
-		return compute.Result{}, err
+		return Report{}, err
 	}
 	baseRTT := compute.BaseRTT(baseSamples, c.BaselinePct)
 
 	// Capacity gate: can we reach the provisioned tier? If so the access link is
 	// the bottleneck (bottleneck localization).
 	if err := c.Load.SetRateBps(c.ProvisionedDownBps); err != nil {
-		return compute.Result{}, err
+		return Report{}, err
 	}
 	c.Clock.Sleep(c.LoadSettle) // let an async flow ramp before reading achieved
 	achieved := c.Load.AchievedBps()
@@ -110,16 +129,16 @@ func (e *Engine) Run() (compute.Result, error) {
 	// Phase 2: loaded (overshoot to build a standing queue). LL probe vs classic
 	// probe under the same load.
 	if err := c.Load.SetRateBps(c.OvershootBps); err != nil {
-		return compute.Result{}, err
+		return Report{}, err
 	}
 	c.Clock.Sleep(c.LoadSettle) // let the queue (if any) build before probing
 	llHist, llSurvival, _, err := e.histBatch(cnet.LLMark, c.LoadedProbes, baseRTT)
 	if err != nil {
-		return compute.Result{}, err
+		return Report{}, err
 	}
 	classicHist, _, _, err := e.histBatch(cnet.NotECT, c.LoadedProbes, baseRTT)
 	if err != nil {
-		return compute.Result{}, err
+		return Report{}, err
 	}
 	standingQueueOK := classicHist.Quantile(0.5) >= c.StandingQueueMinMs
 
@@ -127,12 +146,12 @@ func (e *Engine) Run() (compute.Result, error) {
 	soloThroughput := c.Load.AchievedBps()
 	soloHist, _, _, err := e.histBatch(cnet.NotECT, c.LoadedProbes, baseRTT)
 	if err != nil {
-		return compute.Result{}, err
+		return Report{}, err
 	}
 	withLLThroughput := c.Load.AchievedBps()
 	withHist, _, _, err := e.histBatch(cnet.NotECT, c.LoadedProbes, baseRTT)
 	if err != nil {
-		return compute.Result{}, err
+		return Report{}, err
 	}
 	c.Load.Stop()
 
@@ -147,7 +166,15 @@ func (e *Engine) Run() (compute.Result, error) {
 		ClassicSoloP99Ms:           soloHist.Quantile(0.99),
 		ClassicWithLLP99Ms:         withHist.Quantile(0.99),
 	}
-	return compute.Evaluate(in, c.Thresholds), nil
+	return Report{
+		Result:               compute.Evaluate(in, c.Thresholds),
+		BaseRTTms:            baseRTT,
+		MarkingSurvival:      llSurvival,
+		CapacityAchievedBps:  achieved,
+		OvershootAchievedBps: withLLThroughput,
+		DownLL:               llHist,
+		DownClassic:          classicHist,
+	}, nil
 }
 
 // BatchProbe sends n probes of the given marking through conn and drains all
