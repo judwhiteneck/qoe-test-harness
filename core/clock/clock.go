@@ -28,3 +28,7 @@ func (f *Fake) Since(t time.Time) time.Duration { return f.t.Sub(t) }
 
 // Advance moves the fake clock forward.
 func (f *Fake) Advance(d time.Duration) { f.t = f.t.Add(d) }
+
+// Set jumps the fake clock to t. Used by the loopback simulator to advance time
+// to a packet's delivery instant.
+func (f *Fake) Set(t time.Time) { f.t = t }

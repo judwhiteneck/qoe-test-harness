@@ -21,6 +21,14 @@ func TestFakeIsDeterministic(t *testing.T) {
 	}
 }
 
+func TestSystemClock(t *testing.T) {
+	var c Clock = System{}
+	t0 := c.Now()
+	if d := c.Since(t0); d < 0 {
+		t.Fatalf("Since returned negative: %v", d)
+	}
+}
+
 // System must satisfy the Clock interface.
 var _ Clock = System{}
 var _ Clock = (*Fake)(nil)
