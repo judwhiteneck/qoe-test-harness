@@ -59,15 +59,20 @@ downstream and echoes back the truth.
 
 ## Status
 
-Core implemented and tested; load generator and clients (Android/iOS) pending; M0
-spikes need hardware. Built so far:
+Core implemented and tested; clients (Android/iOS) pending; M0 spikes need
+hardware. Built so far:
 
 - `core/compute` — histogram, stats, verdict (pure, 93%+ coverage)
-- `core/protocol` — wire format + return-routability handshake
+- `core/protocol` — wire format, return-routability handshake, load-stat report
 - `core/clock`, `core/net` — injectable time + I/O seams, plus a loopback simulator
 - `core/engine` — the phase sequence → verdict, tested across pass/fail/inconclusive
 - `core/net` real UDP socket (Linux) with `IP_TOS`/`IP_RECVTOS` marking
-- `server/` + `cli/` binaries, validated end to end over real UDP (marking survives)
+- `core/net` load generator — clock-driven `Pacer` + throughput `Meter` (pure,
+  unit-tested), and a real upstream `UDPLoad` controller whose achieved rate is
+  measured at the server; validated end to end over loopback (100 Mbps paced →
+  100 Mbps achieved, probes run concurrently under load)
+- `server/` + `cli/` binaries, validated end to end over real UDP (marking
+  survives; `qoe-cli -load-mbps N` probes under live upstream load)
 
 Full spec in [`docs/spec.md`](docs/spec.md), M0 plan in [`docs/m0-spec.md`](docs/m0-spec.md),
 architecture and required practices in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) /
@@ -84,12 +89,17 @@ go build ./...
 
 # end to end over localhost:
 go run ./server/cmd/qoe-server -addr 127.0.0.1:7700 -secret <secret> &
-go run ./cli/cmd/qoe-cli -server 127.0.0.1:7700
+go run ./cli/cmd/qoe-cli -server 127.0.0.1:7700                 # idle probes
+go run ./cli/cmd/qoe-cli -server 127.0.0.1:7700 -load-mbps 100  # probes under load
 ```
 
-The CLI today is a probe-level diagnostic (handshake + marked probe bursts →
-marking survival + working-latency percentiles). Full pass/fail runs arrive with
-the load generator and the M0-calibrated thresholds.
+The CLI today is a probe-level diagnostic: handshake + marked probe bursts →
+marking survival + working-latency percentiles, optionally measured while an
+upstream load flow saturates the path (`-load-mbps`). It is not yet a full
+pass/fail verdict — the engine's complete phase sequence runs against the
+simulator; a real run produces a calibrated verdict once the downstream-load leg
+and the M0-calibrated thresholds land. Standing-queue formation needs a real
+bottleneck (loopback has none), which is M0/S3 on hardware.
 
 ## Milestones
 

@@ -12,16 +12,32 @@ import (
 	"context"
 	"errors"
 	stdnet "net"
+	"sync"
 	"time"
 
 	"github.com/judwhiteneck/qoe-test-harness/core/protocol"
 	"golang.org/x/sys/unix"
 )
 
-// Server handles probe/echo and the handshake on a UDP socket.
+// loadReportInterval bounds how often the server replies to a load flow with a
+// running byte tally. Coarse enough that the reply stream is negligible next to
+// the inbound load (no amplification), fine enough for a responsive rate read.
+const loadReportInterval = 50 * time.Millisecond
+
+// loadCounter is the per-source running tally for an upstream load flow.
+type loadCounter struct {
+	bytes uint64
+	last  time.Time
+}
+
+// Server handles probe/echo, the handshake, and upstream load sinking on a UDP
+// socket.
 type Server struct {
 	secret []byte
 	conn   *stdnet.UDPConn
+
+	lmu   sync.Mutex
+	loads map[string]*loadCounter
 }
 
 // Listen binds addr ("host:port"; empty host = all) and enables IP_RECVTOS so the
@@ -35,7 +51,7 @@ func Listen(addr string, secret []byte) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{secret: secret, conn: c}
+	s := &Server{secret: secret, conn: c, loads: make(map[string]*loadCounter)}
 	_ = s.enableRecvTOS() // best-effort; TOSObserved is 0 if unsupported
 	return s, nil
 }
@@ -109,10 +125,44 @@ func (s *Server) handle(b []byte, tos int, src *stdnet.UDPAddr) {
 		s.sendCookie(h.Session, src)
 	case protocol.MsgProbe:
 		s.echoProbe(b, tos, src)
+	case protocol.MsgLoad:
+		// Upstream load: count the bytes and periodically report the running tally
+		// so the client can read the achieved (bottleneck-limited) rate.
+		s.onLoad(len(b), src)
 	case protocol.MsgStart:
 		// Anti-amplification: a high-rate flow starts only if the cookie is valid
 		// for this source. The load generator is a later milestone; we validate here.
 		_ = protocol.VerifyCookie(s.secret, h.Session, src.IP, b[protocol.HeaderSize:])
+	}
+}
+
+// onLoad tallies a received load packet for src and, at most every
+// loadReportInterval, replies with the cumulative byte count and server time.
+func (s *Server) onLoad(n int, src *stdnet.UDPAddr) {
+	now := time.Now()
+	key := src.String()
+
+	s.lmu.Lock()
+	lc := s.loads[key]
+	if lc == nil {
+		lc = &loadCounter{last: now}
+		s.loads[key] = lc
+	}
+	lc.bytes += uint64(n)
+	bytes := lc.bytes
+	report := now.Sub(lc.last) >= loadReportInterval
+	if report {
+		lc.last = now
+	}
+	s.lmu.Unlock()
+
+	if !report {
+		return
+	}
+	stat := protocol.LoadStat{BytesRecv: bytes, TServerNanos: now.UnixNano()}
+	out := make([]byte, protocol.LoadStatSize)
+	if _, err := stat.Marshal(out); err == nil {
+		_, _ = s.conn.WriteToUDP(out, src)
 	}
 }
 

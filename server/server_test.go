@@ -80,3 +80,42 @@ func TestEndToEndOverLoopback(t *testing.T) {
 		t.Log("note: platform did not deliver IP TOS on loopback; on-wire marking is validated in M0/S1 on hardware")
 	}
 }
+
+// TestUDPLoadAchievesTargetOverLoopback runs the real load controller against the
+// real server sink. Loopback has no bottleneck, so the achieved rate (measured at
+// the server from its byte-count reports) should track the paced target. This
+// validates the pacer + measurement plumbing end to end; standing-queue formation
+// under a real bottleneck is M0/S3 on hardware.
+func TestUDPLoadAchievesTargetOverLoopback(t *testing.T) {
+	srv, err := Listen("127.0.0.1:0", []byte("test-secret"))
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = srv.Serve(ctx) }()
+
+	ld, err := cnet.DialUDPLoad(clock.System{}, srv.Addr().String())
+	if err != nil {
+		t.Fatalf("DialUDPLoad: %v", err)
+	}
+	defer ld.Close()
+
+	const target = 50_000_000 // 50 Mbps
+	if err := ld.SetRateBps(target); err != nil {
+		t.Fatalf("SetRateBps: %v", err)
+	}
+	time.Sleep(700 * time.Millisecond) // warm up + several report intervals
+	got := ld.AchievedBps()
+	ld.Stop()
+
+	if got == 0 {
+		t.Fatal("achieved rate is 0: no load-stat reports made it back")
+	}
+	// Wide tolerance: loopback scheduling and the 50 ms report window add jitter.
+	if got < target/2 || got > target*2 {
+		t.Errorf("achieved %d bps, want within 2x of target %d", got, target)
+	}
+}
