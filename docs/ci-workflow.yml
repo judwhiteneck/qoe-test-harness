@@ -1,0 +1,49 @@
+# Reference copy of the CI workflow. To activate: place this at
+# .github/workflows/ci.yml (needs a token with the "workflow" scope, or add via the GitHub web UI).
+---
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "gofmt needed:"; echo "$out"; exit 1; fi
+      - name: go vet
+        run: go vet ./...
+      - name: import boundaries
+        run: bash scripts/check-imports.sh
+      - name: build
+        run: go build ./...
+      - name: test (race + coverage)
+        run: CGO_ENABLED=1 go test -race -covermode=atomic ./...
+      - name: pure-package coverage floor (>= 90%)
+        run: |
+          pkgs="./core/compute/..."
+          [ -d core/protocol ] && pkgs="$pkgs ./core/protocol/..."
+          go test -covermode=atomic -coverprofile=pure.out $pkgs
+          pct=$(go tool cover -func=pure.out | awk '/^total:/{gsub("%","",$3); print $3}')
+          echo "pure-package coverage: ${pct}%"
+          awk -v c="$pct" 'BEGIN{ if (c+0 < 90) { print "FAIL: pure coverage below 90%"; exit 1 } }'
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
