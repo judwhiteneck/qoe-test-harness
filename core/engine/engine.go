@@ -6,10 +6,17 @@
 package engine
 
 import (
+	"time"
+
 	"github.com/judwhiteneck/qoe-test-harness/core/clock"
 	"github.com/judwhiteneck/qoe-test-harness/core/compute"
 	cnet "github.com/judwhiteneck/qoe-test-harness/core/net"
 )
+
+// DefaultLoadSettle is how long Run waits after a rate change before reading the
+// achieved rate / probing, so an asynchronous real load flow has time to ramp and
+// produce a measurement. The Fake clock makes this instantaneous in tests.
+const DefaultLoadSettle = 500 * time.Millisecond
 
 // Config parameterises a run. Clock, Conn, and Load are required; the rest take
 // sensible defaults via New.
@@ -24,10 +31,11 @@ type Config struct {
 
 	BaselineProbes        int
 	LoadedProbes          int
-	OvershootBps          uint64  // default: 1.3x ProvisionedDownBps
-	CapacityToleranceFrac float64 // delivered/tier needed to localize the bottleneck
-	StandingQueueMinMs    float64 // classic median delta to call a standing queue
-	BaselinePct           float64 // percentile for base_rtt (e.g. 0.05 = p5)
+	OvershootBps          uint64        // default: 1.3x ProvisionedDownBps
+	CapacityToleranceFrac float64       // delivered/tier needed to localize the bottleneck
+	StandingQueueMinMs    float64       // classic median delta to call a standing queue
+	BaselinePct           float64       // percentile for base_rtt (e.g. 0.05 = p5)
+	LoadSettle            time.Duration // wait after a rate change before reading/probing
 }
 
 // DefaultConfig holds the non-required defaults.
@@ -39,6 +47,7 @@ func DefaultConfig() Config {
 		CapacityToleranceFrac: 0.9,
 		StandingQueueMinMs:    30,
 		BaselinePct:           0.05,
+		LoadSettle:            DefaultLoadSettle,
 	}
 }
 
@@ -66,6 +75,9 @@ func New(cfg Config) *Engine {
 	if cfg.BaselinePct == 0 {
 		cfg.BaselinePct = d.BaselinePct
 	}
+	if cfg.LoadSettle == 0 {
+		cfg.LoadSettle = d.LoadSettle
+	}
 	if cfg.OvershootBps == 0 {
 		cfg.OvershootBps = cfg.ProvisionedDownBps * 13 / 10
 	}
@@ -91,6 +103,7 @@ func (e *Engine) Run() (compute.Result, error) {
 	if err := c.Load.SetRateBps(c.ProvisionedDownBps); err != nil {
 		return compute.Result{}, err
 	}
+	c.Clock.Sleep(c.LoadSettle) // let an async flow ramp before reading achieved
 	achieved := c.Load.AchievedBps()
 	capacityOK := float64(achieved) >= c.CapacityToleranceFrac*float64(c.ProvisionedDownBps)
 
@@ -99,6 +112,7 @@ func (e *Engine) Run() (compute.Result, error) {
 	if err := c.Load.SetRateBps(c.OvershootBps); err != nil {
 		return compute.Result{}, err
 	}
+	c.Clock.Sleep(c.LoadSettle) // let the queue (if any) build before probing
 	llHist, llSurvival, _, err := e.histBatch(cnet.LLMark, c.LoadedProbes, baseRTT)
 	if err != nil {
 		return compute.Result{}, err

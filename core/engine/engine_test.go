@@ -1,6 +1,7 @@
 package engine_test
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -103,5 +104,74 @@ func TestRunToleratesLoss(t *testing.T) {
 	r := runWith(t, cfg)
 	if r.Verdict != compute.Pass {
 		t.Fatalf("verdict = %s, want pass under 10%% loss", r.Verdict)
+	}
+}
+
+// asyncLoad models a real load controller: AchievedBps reads 0 until the flow has
+// ramped for rampMs of clock time after SetRateBps. It proves Run's LoadSettle
+// gives an asynchronous flow time to produce a measurement before the capacity
+// gate reads it.
+type asyncLoad struct {
+	clk    clock.Clock
+	rampMs int
+	setAt  time.Time
+	rate   uint64
+}
+
+func (a *asyncLoad) SetRateBps(bps uint64) error {
+	a.rate, a.setAt = bps, a.clk.Now()
+	return nil
+}
+
+func (a *asyncLoad) AchievedBps() uint64 {
+	if a.clk.Since(a.setAt) < time.Duration(a.rampMs)*time.Millisecond {
+		return 0 // not ramped yet
+	}
+	return a.rate
+}
+
+func (a *asyncLoad) Stop() { a.rate = 0 }
+
+func hasCaveat(r compute.Result, substr string) bool {
+	for _, c := range r.Caveats {
+		if strings.Contains(c, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRunSettleLetsAsyncLoadRamp(t *testing.T) {
+	const tier = 500_000_000
+	run := func(settle time.Duration) compute.Result {
+		clk := clock.NewFake(time.Unix(1_700_000_000, 0))
+		lo := cnet.NewLoopback(clk, healthy())
+		eng := engine.New(engine.Config{
+			Clock:              clk,
+			Conn:               lo,
+			Load:               &asyncLoad{clk: clk, rampMs: 200},
+			ProvisionedDownBps: tier,
+			ProvisionedUpBps:   50_000_000,
+			BaselineProbes:     50,
+			LoadedProbes:       50,
+			LoadSettle:         settle,
+		})
+		r, err := eng.Run()
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		return r
+	}
+
+	// Settle shorter than the ramp: the gate reads 0, capacity is unconfirmed.
+	short := run(1 * time.Millisecond)
+	if !hasCaveat(short, "capacity gate failed") {
+		t.Errorf("short settle: expected capacity caveat, got %v", short.Caveats)
+	}
+	// Settle longer than the ramp: the flow has measured, capacity confirmed (so
+	// the only remaining caveat is the absent standing queue, not capacity).
+	long := run(500 * time.Millisecond)
+	if hasCaveat(long, "capacity gate failed") {
+		t.Errorf("long settle: capacity should be confirmed, got %v", long.Caveats)
 	}
 }

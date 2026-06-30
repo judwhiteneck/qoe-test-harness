@@ -21,11 +21,25 @@ func TestFakeIsDeterministic(t *testing.T) {
 	}
 }
 
+func TestFakeSleepAdvancesWithoutDelay(t *testing.T) {
+	start := time.Unix(1_700_000_000, 0)
+	f := NewFake(start)
+	wall := time.Now()
+	f.Sleep(10 * time.Second) // huge fake sleep, must be instant in real time
+	if took := time.Since(wall); took > 500*time.Millisecond {
+		t.Fatalf("Fake.Sleep blocked for %v; should be instant", took)
+	}
+	if got := f.Since(start); got != 10*time.Second {
+		t.Fatalf("after Sleep, Since = %v, want 10s", got)
+	}
+}
+
 func TestSystemClock(t *testing.T) {
 	var c Clock = System{}
 	t0 := c.Now()
-	if d := c.Since(t0); d < 0 {
-		t.Fatalf("Since returned negative: %v", d)
+	c.Sleep(time.Millisecond)
+	if d := c.Since(t0); d <= 0 {
+		t.Fatalf("Since after Sleep = %v, want > 0", d)
 	}
 }
 

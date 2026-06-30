@@ -8,9 +8,11 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"github.com/judwhiteneck/qoe-test-harness/core/clock"
@@ -24,12 +26,21 @@ func main() {
 	probes := flag.Int("probes", 200, "probes per marking class")
 	loadMbps := flag.Int("load-mbps", 0, "if >0, run an upstream load flow at this rate during the probe bursts")
 	downMbps := flag.Int("down-mbps", 0, "if >0, run a cookie-gated downstream load flow at this rate during the probe bursts")
+	runFull := flag.Bool("run", false, "run the full engine phase sequence and print the verdict (Result)")
+	downTier := flag.Int("down-tier-mbps", 500, "provisioned downstream tier, Mbps (used by -run)")
+	upTier := flag.Int("up-tier-mbps", 50, "provisioned upstream tier, Mbps (used by -run)")
+	jsonOut := flag.Bool("json", false, "with -run, print the Result as JSON")
 	flag.Parse()
 	if *serverAddr == "" {
 		log.Fatal("--server is required")
 	}
 
 	clk := clock.System{}
+
+	if *runFull {
+		runValidation(clk, *serverAddr, uint64(*downTier)*1_000_000, uint64(*upTier)*1_000_000, *jsonOut)
+		return
+	}
 	conn, err := cnet.DialUDP(clk, *serverAddr)
 	if err != nil {
 		log.Fatalf("dial: %v", err)
@@ -124,4 +135,57 @@ func main() {
 	fmt.Printf("  LL marking survival:           %.1f%% (%d probes)\n", llSurvival*100, len(llRTTs))
 	fmt.Printf("  LL working-delta  p50/p99:     %.2f / %.2f ms\n", llHist.Quantile(0.5), llHist.Quantile(0.99))
 	fmt.Printf("  classic working-delta p50/p99: %.2f / %.2f ms\n", clHist.Quantile(0.5), clHist.Quantile(0.99))
+}
+
+// runValidation wires real sockets into the full engine phase sequence and prints
+// the single-source-of-truth Result. The engine is seam-injected (see
+// docs/ARCHITECTURE.md); this is the composition root that hands it production
+// I/O: a marked-UDP probe socket and the cookie-gated downstream load controller.
+func runValidation(clk clock.Clock, serverAddr string, downBps, upBps uint64, asJSON bool) {
+	conn, err := cnet.DialUDP(clk, serverAddr)
+	if err != nil {
+		log.Fatalf("dial probe socket: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.Handshake(1); err != nil {
+		log.Printf("probe handshake failed (continuing): %v", err)
+	}
+
+	down, err := cnet.DialUDPDownLoad(clk, serverAddr, 2)
+	if err != nil {
+		log.Fatalf("dial downstream load: %v", err)
+	}
+	defer down.Close()
+
+	eng := engine.New(engine.Config{
+		Clock:              clk,
+		Conn:               conn,
+		Load:               down,
+		ProvisionedDownBps: downBps,
+		ProvisionedUpBps:   upBps,
+	})
+	res, err := eng.Run()
+	if err != nil {
+		log.Fatalf("run: %v", err)
+	}
+
+	if asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(res); err != nil {
+			log.Fatalf("encode: %v", err)
+		}
+		return
+	}
+
+	fmt.Printf("qoe-cli validation run\n")
+	fmt.Printf("  server:   %s\n", serverAddr)
+	fmt.Printf("  tiers:    %d down / %d up Mbps\n", downBps/1_000_000, upBps/1_000_000)
+	fmt.Printf("  VERDICT:  %s\n", res.Verdict)
+	for _, sr := range res.SubResults {
+		fmt.Printf("    - %-16s %-12s %s\n", sr.Name, sr.Status, sr.Detail)
+	}
+	for _, cv := range res.Caveats {
+		fmt.Printf("    caveat: %s\n", cv)
+	}
 }

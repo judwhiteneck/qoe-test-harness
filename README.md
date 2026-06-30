@@ -65,7 +65,9 @@ hardware. Built so far:
 - `core/compute` — histogram, stats, verdict (pure, 93%+ coverage)
 - `core/protocol` — wire format, return-routability handshake, load-stat report
 - `core/clock`, `core/net` — injectable time + I/O seams, plus a loopback simulator
-- `core/engine` — the phase sequence → verdict, tested across pass/fail/inconclusive
+- `core/engine` — the phase sequence → verdict, tested across pass/fail/inconclusive,
+  now wired to real sockets (`qoe-cli -run`) with a clock-driven load-settle so
+  asynchronous real flows ramp before the capacity gate reads them
 - `core/net` real UDP socket (Linux) with `IP_TOS`/`IP_RECVTOS` marking
 - `core/net` load generator — clock-driven `Pacer` + throughput `Meter` (pure,
   unit-tested); a real upstream `UDPLoad` controller whose achieved rate is
@@ -93,16 +95,20 @@ go build ./...
 go run ./server/cmd/qoe-server -addr 127.0.0.1:7700 -secret <secret> &
 go run ./cli/cmd/qoe-cli -server 127.0.0.1:7700                              # idle probes
 go run ./cli/cmd/qoe-cli -server 127.0.0.1:7700 -load-mbps 80 -down-mbps 120 # probes under load
+go run ./cli/cmd/qoe-cli -server 127.0.0.1:7700 -run -down-tier-mbps 500     # full verdict
 ```
 
-The CLI today is a probe-level diagnostic: handshake + marked probe bursts →
-marking survival + working-latency percentiles, optionally measured while
-upstream (`-load-mbps`) and/or cookie-gated downstream (`-down-mbps`) load
-saturate the path. It is not yet a full pass/fail verdict — the engine's complete
-phase sequence runs against the simulator; a real run produces a calibrated
-verdict once the load legs are wired into `engine.Run` and the M0-calibrated
-thresholds land. Standing-queue formation needs a real bottleneck (loopback has
-none), which is M0/S3 on hardware.
+The CLI has two modes. The default is a probe-level diagnostic: handshake +
+marked probe bursts → marking survival + working-latency percentiles, optionally
+measured while upstream (`-load-mbps`) and/or cookie-gated downstream
+(`-down-mbps`) load saturate the path. `-run` executes the full engine phase
+sequence (baseline → capacity gate → overshoot → no-harm) over real sockets and
+prints the single-source-of-truth `Result` (add `-json` for the raw contract).
+
+`-run` already produces a real verdict; over loopback it correctly returns
+`inconclusive` ("no sustained standing queue formed") because loopback has no
+bottleneck. A genuine pass needs a real congested link plus the M0-calibrated
+thresholds — standing-queue formation is M0/S3 on hardware.
 
 ## Milestones
 
