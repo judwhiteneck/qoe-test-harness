@@ -1,0 +1,34 @@
+# Go
+/server/server
+/core/*.aar
+/core/*.xcframework
+*.test
+*.out
+vendor/
+
+# Build artifacts
+*.so
+*.dylib
+
+# iOS / Xcode
+ios/build/
+ios/DerivedData/
+ios/Pods/
+*.xcuserstate
+ios/*.xcframework
+
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/*.aar
+android/.idea/
+
+# Env / secrets
+.env
+*.local
+server/config.local.*
+
+# OS
+.DS_Store
