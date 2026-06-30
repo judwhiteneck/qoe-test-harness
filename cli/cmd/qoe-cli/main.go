@@ -23,6 +23,7 @@ func main() {
 	serverAddr := flag.String("server", "", "test server host:port (required)")
 	probes := flag.Int("probes", 200, "probes per marking class")
 	loadMbps := flag.Int("load-mbps", 0, "if >0, run an upstream load flow at this rate during the probe bursts")
+	downMbps := flag.Int("down-mbps", 0, "if >0, run a cookie-gated downstream load flow at this rate during the probe bursts")
 	flag.Parse()
 	if *serverAddr == "" {
 		log.Fatal("--server is required")
@@ -47,7 +48,7 @@ func main() {
 	}
 	baseRTT := compute.BaseRTT(base, 0.05)
 
-	// Optionally saturate the upstream on a separate socket while we probe.
+	// Optionally saturate the path on separate sockets while we probe.
 	var load *cnet.UDPLoad
 	if *loadMbps > 0 {
 		load, err = cnet.DialUDPLoad(clk, *serverAddr)
@@ -58,6 +59,19 @@ func main() {
 		if err := load.SetRateBps(uint64(*loadMbps) * 1_000_000); err != nil {
 			log.Fatalf("start load: %v", err)
 		}
+	}
+	var down *cnet.UDPDownLoad
+	if *downMbps > 0 {
+		down, err = cnet.DialUDPDownLoad(clk, *serverAddr, 2)
+		if err != nil {
+			log.Fatalf("dial downstream load: %v", err)
+		}
+		defer down.Close()
+		if err := down.SetRateBps(uint64(*downMbps) * 1_000_000); err != nil {
+			log.Fatalf("start downstream load: %v", err)
+		}
+	}
+	if load != nil || down != nil {
 		time.Sleep(500 * time.Millisecond) // let the queue (if any) build before probing
 	}
 
@@ -70,10 +84,14 @@ func main() {
 		log.Fatalf("classic probes: %v", err)
 	}
 
-	var achieved uint64
+	var upAchieved, downAchieved uint64
 	if load != nil {
-		achieved = load.AchievedBps()
+		upAchieved = load.AchievedBps()
 		load.Stop()
+	}
+	if down != nil {
+		downAchieved = down.AchievedBps()
+		down.Stop()
 	}
 
 	llHist := compute.NewDefaultHistogram()
@@ -86,14 +104,22 @@ func main() {
 	}
 
 	mode := "idle"
-	if *loadMbps > 0 {
+	switch {
+	case *loadMbps > 0 && *downMbps > 0:
+		mode = fmt.Sprintf("under %d up / %d down Mbps load", *loadMbps, *downMbps)
+	case *loadMbps > 0:
 		mode = fmt.Sprintf("under %d Mbps upstream load", *loadMbps)
+	case *downMbps > 0:
+		mode = fmt.Sprintf("under %d Mbps downstream load", *downMbps)
 	}
 	fmt.Printf("qoe-cli probe diagnostic (%s; not a full verdict)\n", mode)
 	fmt.Printf("  server:                        %s\n", *serverAddr)
 	fmt.Printf("  base RTT (p5):                 %.2f ms\n", baseRTT)
 	if load != nil {
-		fmt.Printf("  upstream load achieved:        %.1f Mbps (target %d)\n", float64(achieved)/1e6, *loadMbps)
+		fmt.Printf("  upstream load achieved:        %.1f Mbps (target %d)\n", float64(upAchieved)/1e6, *loadMbps)
+	}
+	if down != nil {
+		fmt.Printf("  downstream load achieved:      %.1f Mbps (target %d)\n", float64(downAchieved)/1e6, *downMbps)
 	}
 	fmt.Printf("  LL marking survival:           %.1f%% (%d probes)\n", llSurvival*100, len(llRTTs))
 	fmt.Printf("  LL working-delta  p50/p99:     %.2f / %.2f ms\n", llHist.Quantile(0.5), llHist.Quantile(0.99))

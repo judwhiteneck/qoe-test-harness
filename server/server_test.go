@@ -4,11 +4,13 @@ package server
 
 import (
 	"context"
+	stdnet "net"
 	"testing"
 	"time"
 
 	"github.com/judwhiteneck/qoe-test-harness/core/clock"
 	cnet "github.com/judwhiteneck/qoe-test-harness/core/net"
+	"github.com/judwhiteneck/qoe-test-harness/core/protocol"
 )
 
 // TestEndToEndOverLoopback runs a real server on 127.0.0.1 and a real UDP client
@@ -117,5 +119,83 @@ func TestUDPLoadAchievesTargetOverLoopback(t *testing.T) {
 	// Wide tolerance: loopback scheduling and the 50 ms report window add jitter.
 	if got < target/2 || got > target*2 {
 		t.Errorf("achieved %d bps, want within 2x of target %d", got, target)
+	}
+}
+
+// TestDownstreamLoadAchievesTargetWithCookie exercises the full cookie-gated
+// downstream path: handshake -> Start (with cookie) -> server-paced flow ->
+// client measures the received rate. Loopback has no bottleneck, so the achieved
+// rate tracks the paced target.
+func TestDownstreamLoadAchievesTargetWithCookie(t *testing.T) {
+	srv, err := Listen("127.0.0.1:0", []byte("test-secret"))
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = srv.Serve(ctx) }()
+
+	dl, err := cnet.DialUDPDownLoad(clock.System{}, srv.Addr().String(), 1)
+	if err != nil {
+		t.Fatalf("DialUDPDownLoad: %v", err)
+	}
+	defer dl.Close()
+
+	const target = 50_000_000
+	if err := dl.SetRateBps(target); err != nil {
+		t.Fatalf("SetRateBps: %v", err)
+	}
+	time.Sleep(700 * time.Millisecond)
+	got := dl.AchievedBps()
+	dl.Stop()
+
+	if got == 0 {
+		t.Fatal("achieved 0: no downstream flow arrived despite a valid cookie")
+	}
+	if got < target/2 || got > target*2 {
+		t.Errorf("achieved %d bps, want within 2x of target %d", got, target)
+	}
+}
+
+// TestDownstreamLoadRefusedWithoutCookie is the anti-amplification guarantee
+// (spec G1): a Start with no valid cookie must produce NO downstream flow, so the
+// server cannot be turned into a reflector against a spoofed victim. We send a
+// Start with a bogus cookie and confirm not a single packet comes back.
+func TestDownstreamLoadRefusedWithoutCookie(t *testing.T) {
+	srv, err := Listen("127.0.0.1:0", []byte("test-secret"))
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = srv.Serve(ctx) }()
+
+	raddr, err := stdnet.ResolveUDPAddr("udp4", srv.Addr().String())
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	c, err := stdnet.DialUDP("udp4", nil, raddr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	// A Start with a forged (all-zero) cookie — the attacker never did the handshake.
+	start := protocol.Start{Header: protocol.Header{Session: 1}, RateBps: 50_000_000, DurationMs: 5000}
+	out := make([]byte, protocol.StartSize)
+	if _, err := start.Marshal(out); err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if _, err := c.Write(out); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// Expect silence: read should time out with zero bytes.
+	_ = c.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
+	buf := make([]byte, 2048)
+	if n, err := c.Read(buf); err == nil {
+		t.Fatalf("server sent %d bytes for a forged-cookie Start; amplification gate breached", n)
 	}
 }

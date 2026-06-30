@@ -15,14 +15,27 @@ import (
 	"sync"
 	"time"
 
+	"github.com/judwhiteneck/qoe-test-harness/core/clock"
+	cnet "github.com/judwhiteneck/qoe-test-harness/core/net"
 	"github.com/judwhiteneck/qoe-test-harness/core/protocol"
 	"golang.org/x/sys/unix"
 )
 
-// loadReportInterval bounds how often the server replies to a load flow with a
-// running byte tally. Coarse enough that the reply stream is negligible next to
-// the inbound load (no amplification), fine enough for a responsive rate read.
-const loadReportInterval = 50 * time.Millisecond
+const (
+	// loadReportInterval bounds how often the server replies to an upstream load
+	// flow with a running byte tally. Coarse enough that the reply stream is
+	// negligible next to the inbound load (no amplification), fine enough for a
+	// responsive rate read.
+	loadReportInterval = 50 * time.Millisecond
+
+	// Downstream-flow bounds. A valid cookie authorizes a flow, but these caps
+	// ensure a single Start still cannot be turned into an unbounded blast at the
+	// (proven-reachable) client — defense in depth behind the cookie gate.
+	maxDownRateBps    = 1_000_000_000 // 1 Gbps ceiling
+	maxDownDurationMs = 30_000        // 30 s ceiling; the client renews for longer
+	downPktSize       = 1200
+	downTick          = time.Millisecond
+)
 
 // loadCounter is the per-source running tally for an upstream load flow.
 type loadCounter struct {
@@ -30,14 +43,23 @@ type loadCounter struct {
 	last  time.Time
 }
 
-// Server handles probe/echo, the handshake, and upstream load sinking on a UDP
-// socket.
+// downFlow is a live downstream flow; the pointer identity lets a finishing flow
+// avoid deleting a newer flow that replaced it for the same source.
+type downFlow struct {
+	cancel context.CancelFunc
+}
+
+// Server handles probe/echo, the handshake, upstream load sinking, and (behind
+// the cookie gate) downstream load generation on a UDP socket.
 type Server struct {
 	secret []byte
 	conn   *stdnet.UDPConn
 
 	lmu   sync.Mutex
 	loads map[string]*loadCounter
+
+	dmu   sync.Mutex
+	downs map[string]*downFlow // per-source downstream flows
 }
 
 // Listen binds addr ("host:port"; empty host = all) and enables IP_RECVTOS so the
@@ -51,7 +73,12 @@ func Listen(addr string, secret []byte) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{secret: secret, conn: c, loads: make(map[string]*loadCounter)}
+	s := &Server{
+		secret: secret,
+		conn:   c,
+		loads:  make(map[string]*loadCounter),
+		downs:  make(map[string]*downFlow),
+	}
 	_ = s.enableRecvTOS() // best-effort; TOSObserved is 0 if unsupported
 	return s, nil
 }
@@ -73,8 +100,16 @@ func (s *Server) enableRecvTOS() error {
 // Addr returns the bound local address (useful when binding to :0 in tests).
 func (s *Server) Addr() stdnet.Addr { return s.conn.LocalAddr() }
 
-// Close closes the socket.
-func (s *Server) Close() error { return s.conn.Close() }
+// Close cancels any in-flight downstream flows and closes the socket.
+func (s *Server) Close() error {
+	s.dmu.Lock()
+	for key, df := range s.downs {
+		df.cancel()
+		delete(s.downs, key)
+	}
+	s.dmu.Unlock()
+	return s.conn.Close()
+}
 
 // Serve reads and handles packets until ctx is cancelled.
 func (s *Server) Serve(ctx context.Context) error {
@@ -130,9 +165,101 @@ func (s *Server) handle(b []byte, tos int, src *stdnet.UDPAddr) {
 		// so the client can read the achieved (bottleneck-limited) rate.
 		s.onLoad(len(b), src)
 	case protocol.MsgStart:
-		// Anti-amplification: a high-rate flow starts only if the cookie is valid
-		// for this source. The load generator is a later milestone; we validate here.
-		_ = protocol.VerifyCookie(s.secret, h.Session, src.IP, b[protocol.HeaderSize:])
+		s.onStart(b, src)
+	case protocol.MsgStop:
+		s.onStop(h, b, src)
+	}
+}
+
+// onStart begins a paced downstream flow, but ONLY after the cookie proves the
+// requester actually receives at src.IP (spec G1, anti-amplification). Without a
+// valid cookie this is a no-op: the server never sends bulk traffic to an
+// unverified address, so it cannot be used to flood a spoofed victim.
+func (s *Server) onStart(b []byte, src *stdnet.UDPAddr) {
+	st, err := protocol.UnmarshalStart(b)
+	if err != nil {
+		return
+	}
+	if !protocol.VerifyCookie(s.secret, st.Session, src.IP, st.Cookie[:]) {
+		return // no cookie, no flow
+	}
+	rate := st.RateBps
+	if rate > maxDownRateBps {
+		rate = maxDownRateBps
+	}
+	dur := time.Duration(st.DurationMs) * time.Millisecond
+	if dur <= 0 || dur > maxDownDurationMs*time.Millisecond {
+		dur = maxDownDurationMs * time.Millisecond
+	}
+	s.startDown(src, rate, dur)
+}
+
+// onStop cancels the caller's downstream flow. It requires the same cookie so a
+// stranger cannot cancel another tester's flow.
+func (s *Server) onStop(h protocol.Header, b []byte, src *stdnet.UDPAddr) {
+	if len(b) < protocol.HeaderSize+protocol.CookieSize {
+		return
+	}
+	if !protocol.VerifyCookie(s.secret, h.Session, src.IP, b[protocol.HeaderSize:protocol.HeaderSize+protocol.CookieSize]) {
+		return
+	}
+	s.stopDown(src.String())
+}
+
+func (s *Server) startDown(src *stdnet.UDPAddr, rate uint64, dur time.Duration) {
+	key := src.String()
+	ctx, cancel := context.WithTimeout(context.Background(), dur)
+	df := &downFlow{cancel: cancel}
+	s.dmu.Lock()
+	if old := s.downs[key]; old != nil {
+		old.cancel() // replace any existing flow for this source
+	}
+	s.downs[key] = df
+	s.dmu.Unlock()
+	go s.downLoop(ctx, key, df, src, rate)
+}
+
+func (s *Server) stopDown(key string) {
+	s.dmu.Lock()
+	if df := s.downs[key]; df != nil {
+		df.cancel()
+		delete(s.downs, key)
+	}
+	s.dmu.Unlock()
+}
+
+// downLoop paces bulk packets to src until the context's deadline or a cancel.
+// The flow is currently classic (unmarked): its job is to congest the bottleneck.
+// Setting ECT(1)/NQB on the downstream bytes is applied and verified on the wire
+// in M0/S2 on hardware; the carried Marking field reserves the format for it.
+func (s *Server) downLoop(ctx context.Context, key string, df *downFlow, src *stdnet.UDPAddr, rate uint64) {
+	defer func() {
+		// Only retire the map entry if it is still ours; a newer flow may have
+		// replaced us for this source.
+		s.dmu.Lock()
+		if s.downs[key] == df {
+			delete(s.downs, key)
+		}
+		s.dmu.Unlock()
+	}()
+	pacer := cnet.NewPacer(clock.System{}, downPktSize, rate)
+	buf := make([]byte, downPktSize)
+	_, _ = (protocol.Header{Type: protocol.MsgLoad}).Marshal(buf) // header prefix; rest padding
+	ticker := time.NewTicker(downTick)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			due := pacer.Due()
+			for i := 0; i < due; i++ {
+				if _, err := s.conn.WriteToUDP(buf, src); err != nil {
+					break
+				}
+			}
+			pacer.MarkSent(due)
+		}
 	}
 }
 

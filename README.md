@@ -68,11 +68,13 @@ hardware. Built so far:
 - `core/engine` — the phase sequence → verdict, tested across pass/fail/inconclusive
 - `core/net` real UDP socket (Linux) with `IP_TOS`/`IP_RECVTOS` marking
 - `core/net` load generator — clock-driven `Pacer` + throughput `Meter` (pure,
-  unit-tested), and a real upstream `UDPLoad` controller whose achieved rate is
-  measured at the server; validated end to end over loopback (100 Mbps paced →
-  100 Mbps achieved, probes run concurrently under load)
+  unit-tested); a real upstream `UDPLoad` controller whose achieved rate is
+  measured at the server; and a cookie-gated downstream `UDPDownLoad` (handshake
+  → `Start` with cookie → server-paced flow), with the **anti-amplification gate
+  tested** (a forged-cookie `Start` yields zero downstream bytes). Validated over
+  loopback: paced rate ≈ achieved in both directions, probes run concurrently
 - `server/` + `cli/` binaries, validated end to end over real UDP (marking
-  survives; `qoe-cli -load-mbps N` probes under live upstream load)
+  survives; `qoe-cli -load-mbps N -down-mbps M` probes under live bidirectional load)
 
 Full spec in [`docs/spec.md`](docs/spec.md), M0 plan in [`docs/m0-spec.md`](docs/m0-spec.md),
 architecture and required practices in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) /
@@ -89,17 +91,18 @@ go build ./...
 
 # end to end over localhost:
 go run ./server/cmd/qoe-server -addr 127.0.0.1:7700 -secret <secret> &
-go run ./cli/cmd/qoe-cli -server 127.0.0.1:7700                 # idle probes
-go run ./cli/cmd/qoe-cli -server 127.0.0.1:7700 -load-mbps 100  # probes under load
+go run ./cli/cmd/qoe-cli -server 127.0.0.1:7700                              # idle probes
+go run ./cli/cmd/qoe-cli -server 127.0.0.1:7700 -load-mbps 80 -down-mbps 120 # probes under load
 ```
 
 The CLI today is a probe-level diagnostic: handshake + marked probe bursts →
-marking survival + working-latency percentiles, optionally measured while an
-upstream load flow saturates the path (`-load-mbps`). It is not yet a full
-pass/fail verdict — the engine's complete phase sequence runs against the
-simulator; a real run produces a calibrated verdict once the downstream-load leg
-and the M0-calibrated thresholds land. Standing-queue formation needs a real
-bottleneck (loopback has none), which is M0/S3 on hardware.
+marking survival + working-latency percentiles, optionally measured while
+upstream (`-load-mbps`) and/or cookie-gated downstream (`-down-mbps`) load
+saturate the path. It is not yet a full pass/fail verdict — the engine's complete
+phase sequence runs against the simulator; a real run produces a calibrated
+verdict once the load legs are wired into `engine.Run` and the M0-calibrated
+thresholds land. Standing-queue formation needs a real bottleneck (loopback has
+none), which is M0/S3 on hardware.
 
 ## Milestones
 
