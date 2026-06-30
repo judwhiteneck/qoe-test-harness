@@ -16,20 +16,27 @@ downstream and echoes back the truth.
 ## Architecture
 
 ```
- iOS app (SwiftUI)  ─┐
-                     ├─ shared Go core (gomobile) ──UDP test protocol──> VPS server (Go)
- Android (Compose) ──┘     sockets, ECT(1)/NQB marking,                  marks downstream ECT(1)/NQB,
-                           both-direction flows, scalable CC,            echoes received TOS, timestamps,
-                           timing, marking self-test                     ingests to Postgres,
-                                                                          engineer web dashboard
+ wired CLI (Go) ──┐
+ Android (later) ─┼─ shared Go core ──UDP test protocol──> VPS server (Go, Hostinger, off-net)
+ iOS (gated) ─────┘   pure-compute + sockets, marking,      marks downstream ECT(1)/NQB,
+                      overshoot load, standing-queue          echoes received TOS, timestamps,
+                      confirm, timing, histograms             return-routability handshake,
+                                                              capacity gate, 1-slot serialize,
+                                                              Postgres ingest, dashboard
 ```
 
 | Component | Tech | Role |
 |---|---|---|
-| `server/` | Go (Hostinger KVM2) | UDP test endpoint, TOS echo, serialization, Postgres ingest, engineer dashboard |
-| `core/` | Go (gomobile) | shared test engine: sockets, marking, flows, timing, histograms, self-test |
-| `ios/` | SwiftUI + core (TestFlight) | field-tester verdict + engineer detail |
-| `android/` | Compose + core (APK / Firebase) | field-tester verdict + engineer detail |
+| `server/` | Go (Hostinger KVM2, off-net) | UDP endpoint, TOS echo, return-routability handshake, capacity gate, 1-slot serialization, Postgres ingest, engineer dashboard |
+| `core/` | Go | shared engine; `compute/` pure (histograms/verdict/stats) + `net/` sockets/marking/load |
+| `cli/` | Go (wired) | primary wedge: technician runs wired to the modem |
+| `android/` | Compose + core (gomobile/JNI) | field app, after CLI proves out |
+| `ios/` | SwiftUI + native net + shared compute | demand-gated |
+
+> v2 (post-autoplan): wired CLI-first instead of two native apps day-one — WiFi
+> confounds the DOCSIS measurement and gomobile GC jitter pollutes the p99 tail.
+> Server stays off-net, made valid by a per-run capacity-confirmation gate. See
+> [`docs/autoplan-review.md`](docs/autoplan-review.md).
 
 ## Key measurement decisions
 
@@ -59,14 +66,16 @@ Pre-implementation. Full spec in [`docs/spec.md`](docs/spec.md), wire protocol i
 ## Milestones
 
 ```
-M0 iOS marking spike → M1 server + shared core → M2 Android app → M3 iOS app → M4 calibration + dashboard
+M0 (spikes, gate all) → M1 server + core + wired CLI + dashboard → M2 Android → M3 iOS (gated) → M4 calibration + polish
 ```
 
-M0 gates everything: if iOS bleaches ECN, the fallback (`Network.framework`
-service classes or NQB-only) is decided before app work starts. Android leads
-because it distributes and marks most easily.
+M0 spikes every kill-shot before any client build: marking survival + on-wire
+capture, DSCP/ECN transit survival on the target network, overshoot standing-queue
+formation, capacity-confirmation method, server perf at ≤600 Mbps with TOS-echo,
+return-routability handshake, and a negative control (LLD-off must not pass).
 
 ## Out of scope (MVP)
 
-Multi-gig (>1 Gbps) load, browser/desktop client, CMTS-side A/B toggling of LLD,
-fine GPS location, automated headend config validation.
+Multi-gig / gig-from-a-gig-port (needs on-net or bigger server), browser/desktop
+GUI client, CMTS-side A/B toggling of LLD, fine GPS location, automated headend
+config validation.
