@@ -88,7 +88,8 @@ hardware. Built so far:
 
 Full spec in [`docs/spec.md`](docs/spec.md), M0 plan in [`docs/m0-spec.md`](docs/m0-spec.md),
 architecture and required practices in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) /
-[`docs/ENGINEERING.md`](docs/ENGINEERING.md).
+[`docs/ENGINEERING.md`](docs/ENGINEERING.md). Deploying (VPS server + tester CLI,
+incl. Windows/WSL2): [`docs/DEPLOY.md`](docs/DEPLOY.md).
 
 ## Build & run
 
