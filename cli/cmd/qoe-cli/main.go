@@ -1,10 +1,15 @@
-// Command qoe-cli is the wired diagnostic client. It handshakes with the server,
-// measures an idle baseline, then runs marked probe bursts and reports marking
-// survival and working-latency percentiles. With -load-mbps it also drives an
-// upstream load flow on a separate socket so the probe bursts measure loaded
-// latency (and prints the achieved bottleneck rate). NOTE: this is still a
-// diagnostic, not a full pass/fail verdict — the calibrated thresholds and the
-// downstream-load leg arrive with M0.
+// Command qoe-cli is the wired field client — the CLI-first wedge. Two modes:
+//
+//   - default: a probe-level diagnostic (handshake + marked probe bursts →
+//     marking survival + working-latency percentiles), optionally under upstream
+//     (-load-mbps) and/or cookie-gated downstream (-down-mbps) load.
+//   - -run: the full engine phase sequence → a role-switched verdict. Field techs
+//     see a pass/fail checklist (render.Field); -engineer prints telemetry;
+//     -json emits the RunReport contract; -submit posts it to the dashboard.
+//
+// The CLI marks packets itself via IP_TOS, so no separate "helper" is needed —
+// that requirement belonged to the abandoned browser design. The verdict's
+// pass/fail thresholds are calibrated in M0 on real hardware.
 package main
 
 import (
@@ -22,6 +27,8 @@ import (
 	"github.com/judwhiteneck/qoe-test-harness/core/engine"
 	cnet "github.com/judwhiteneck/qoe-test-harness/core/net"
 	"github.com/judwhiteneck/qoe-test-harness/core/report"
+
+	"github.com/judwhiteneck/qoe-test-harness/cli/internal/render"
 )
 
 func main() {
@@ -32,7 +39,8 @@ func main() {
 	runFull := flag.Bool("run", false, "run the full engine phase sequence and print the verdict (Result)")
 	downTier := flag.Int("down-tier-mbps", 500, "provisioned downstream tier, Mbps (used by -run)")
 	upTier := flag.Int("up-tier-mbps", 50, "provisioned upstream tier, Mbps (used by -run)")
-	jsonOut := flag.Bool("json", false, "with -run, print the Result as JSON")
+	jsonOut := flag.Bool("json", false, "with -run, print the RunReport as JSON")
+	engineerView := flag.Bool("engineer", false, "with -run, print full telemetry instead of the field pass/fail view")
 	submitURL := flag.String("submit", "", "with -run, POST the full RunReport to this dashboard ingest URL")
 	isp := flag.String("isp", "", "cohort tag: ISP name (recorded in the report)")
 	region := flag.String("region", "", "cohort tag: region (recorded in the report)")
@@ -49,6 +57,7 @@ func main() {
 			downBps:    uint64(*downTier) * 1_000_000,
 			upBps:      uint64(*upTier) * 1_000_000,
 			asJSON:     *jsonOut,
+			engineer:   *engineerView,
 			submitURL:  *submitURL,
 			isp:        *isp,
 			region:     *region,
@@ -155,6 +164,7 @@ type runOpts struct {
 	serverAddr     string
 	downBps, upBps uint64
 	asJSON         bool
+	engineer       bool
 	submitURL      string
 	isp, region    string
 }
@@ -215,24 +225,17 @@ func runValidation(clk clock.Clock, o runOpts) {
 		},
 	}
 
-	if o.asJSON {
+	switch {
+	case o.asJSON:
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		if err := enc.Encode(rr); err != nil {
 			log.Fatalf("encode: %v", err)
 		}
-	} else {
-		fmt.Printf("qoe-cli validation run\n")
-		fmt.Printf("  server:   %s\n", o.serverAddr)
-		fmt.Printf("  tiers:    %d down / %d up Mbps\n", o.downBps/1_000_000, o.upBps/1_000_000)
-		fmt.Printf("  base RTT: %.2f ms · marking survival: %.1f%%\n", rep.BaseRTTms, rep.MarkingSurvival*100)
-		fmt.Printf("  VERDICT:  %s\n", rep.Result.Verdict)
-		for _, sr := range rep.Result.SubResults {
-			fmt.Printf("    - %-16s %-12s %s\n", sr.Name, sr.Status, sr.Detail)
-		}
-		for _, cv := range rep.Result.Caveats {
-			fmt.Printf("    caveat: %s\n", cv)
-		}
+	case o.engineer:
+		fmt.Print(render.Engineer(rr))
+	default:
+		fmt.Print(render.Field(rr))
 	}
 
 	if o.submitURL != "" {

@@ -103,7 +103,8 @@ go build ./...
 go run ./server/cmd/qoe-server -addr 127.0.0.1:7700 -secret <secret> &
 go run ./cli/cmd/qoe-cli -server 127.0.0.1:7700                              # idle probes
 go run ./cli/cmd/qoe-cli -server 127.0.0.1:7700 -load-mbps 80 -down-mbps 120 # probes under load
-go run ./cli/cmd/qoe-cli -server 127.0.0.1:7700 -run -down-tier-mbps 500     # full verdict
+go run ./cli/cmd/qoe-cli -server 127.0.0.1:7700 -run -down-tier-mbps 500     # field pass/fail
+go run ./cli/cmd/qoe-cli -server 127.0.0.1:7700 -run -engineer               # + telemetry
 
 # engineer dashboard (in-memory store) + submit a run to it:
 go run ./dashboard/cmd/qoe-dashboard -addr :8080 &
@@ -112,12 +113,16 @@ go run ./cli/cmd/qoe-cli -server 127.0.0.1:7700 -run -isp Acme -region west \
 # then open http://127.0.0.1:8080 for the LL-vs-classic CDF overlay
 ```
 
-The CLI has two modes. The default is a probe-level diagnostic: handshake +
+The CLI is the wedge. Default mode is a probe-level diagnostic: handshake +
 marked probe bursts → marking survival + working-latency percentiles, optionally
 measured while upstream (`-load-mbps`) and/or cookie-gated downstream
 (`-down-mbps`) load saturate the path. `-run` executes the full engine phase
 sequence (baseline → capacity gate → overshoot → no-harm) over real sockets and
-prints the single-source-of-truth `Result` (add `-json` for the raw contract).
+reports the verdict **role-switched** (spec "Both, role-switched"): a field tech
+gets a clean pass/fail checklist with plain-language guidance; `-engineer` prints
+the telemetry; `-json` emits the raw `RunReport` contract; `-submit URL` posts it
+to the dashboard. The CLI marks packets itself (`IP_TOS`), so no separate helper
+is needed — that was a requirement of the abandoned browser design.
 
 `-run` already produces a real verdict; over loopback it correctly returns
 `inconclusive` ("no sustained standing queue formed") because loopback has no
