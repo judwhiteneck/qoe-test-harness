@@ -35,6 +35,7 @@ type UDPDownLoad struct {
 
 	cookie    [protocol.CookieSize]byte
 	haveToken bool
+	mark      uint8
 
 	mu       sync.Mutex
 	achieved uint64
@@ -102,6 +103,7 @@ func (d *UDPDownLoad) SetRateBps(bps uint64) error {
 		Cookie:     d.cookie,
 		RateBps:    bps,
 		DurationMs: downDefaultDurationMs,
+		Marking:    d.mark,
 	}
 	out := make([]byte, protocol.StartSize)
 	if _, err := start.Marshal(out); err != nil {
@@ -178,5 +180,9 @@ func (d *UDPDownLoad) Close() error {
 	d.Stop()
 	return d.conn.Close()
 }
+
+// SetMarking records the IP TOS the server should set on the downstream flow
+// (0 = classic). Call before SetRateBps; it rides in the Start request.
+func (d *UDPDownLoad) SetMarking(m Marking) { d.mark = uint8(m) }
 
 var _ LoadController = (*UDPDownLoad)(nil)

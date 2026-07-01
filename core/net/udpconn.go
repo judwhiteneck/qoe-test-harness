@@ -18,13 +18,15 @@ const DefaultReadTimeout = 200 * time.Millisecond
 
 // UDPConn is the production PacketConn: real connected UDP with per-batch IP TOS
 // marking (ECT(1)/NQB) via setsockopt(IP_TOS), and clock-sync-free RTT (the echo
-// carries back the client send time). Linux only; IPv6 (IPV6_TCLASS) and other
-// platforms are follow-ups.
+// carries back the client send time). It enables IP_RECVTOS so RecvEcho can also
+// report the TOS the echo arrived with (the downstream/return-leg signal). Linux
+// only; IPv6 (IPV6_TCLASS) and other platforms are follow-ups.
 type UDPConn struct {
 	clk         clock.Clock
 	conn        *stdnet.UDPConn
 	readTimeout time.Duration
 	rbuf        []byte
+	oob         []byte
 	lastTOS     int
 }
 
@@ -38,11 +40,27 @@ func DialUDP(clk clock.Clock, serverAddr string) (*UDPConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &UDPConn{clk: clk, conn: c, readTimeout: DefaultReadTimeout, rbuf: make([]byte, 2048), lastTOS: -1}, nil
+	u := &UDPConn{clk: clk, conn: c, readTimeout: DefaultReadTimeout, rbuf: make([]byte, 2048), oob: make([]byte, 256), lastTOS: -1}
+	_ = u.enableRecvTOS() // best-effort; DownTOSObserved is 0 if unsupported
+	return u, nil
 }
 
 // SetReadTimeout overrides the per-recv drain timeout.
 func (u *UDPConn) SetReadTimeout(d time.Duration) { u.readTimeout = d }
+
+func (u *UDPConn) enableRecvTOS() error {
+	rc, err := u.conn.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var serr error
+	if cerr := rc.Control(func(fd uintptr) {
+		serr = unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_RECVTOS, 1)
+	}); cerr != nil {
+		return cerr
+	}
+	return serr
+}
 
 func (u *UDPConn) setTOS(tos int) error {
 	rc, err := u.conn.SyscallConn()
@@ -56,6 +74,22 @@ func (u *UDPConn) setTOS(tos int) error {
 		return cerr
 	}
 	return serr
+}
+
+// parseRecvTOS extracts the received IP TOS byte from recv control messages.
+func parseRecvTOS(oob []byte) int {
+	msgs, err := unix.ParseSocketControlMessage(oob)
+	if err != nil {
+		return 0
+	}
+	for _, m := range msgs {
+		if m.Header.Level == unix.IPPROTO_IP &&
+			(m.Header.Type == unix.IP_TOS || m.Header.Type == unix.IP_RECVTOS) &&
+			len(m.Data) >= 1 {
+			return int(m.Data[0])
+		}
+	}
+	return 0
 }
 
 // Handshake performs return-routability: sends a padded HELLO and returns the
@@ -111,11 +145,13 @@ func (u *UDPConn) SendProbe(p Probe) error {
 }
 
 // RecvEcho reads one echo, or returns ErrNoEcho on read timeout (batch drained).
+// It also reads the TOS the echo arrived with (IP_RECVTOS) so the caller can see
+// downstream marking survival and downstream CE.
 func (u *UDPConn) RecvEcho() (Echo, error) {
 	if err := u.conn.SetReadDeadline(time.Now().Add(u.readTimeout)); err != nil {
 		return Echo{}, err
 	}
-	n, err := u.conn.Read(u.rbuf)
+	n, oobn, _, _, err := u.conn.ReadMsgUDP(u.rbuf, u.oob)
 	if err != nil {
 		var ne stdnet.Error
 		if errors.As(err, &ne) && ne.Timeout() {
@@ -124,17 +160,20 @@ func (u *UDPConn) RecvEcho() (Echo, error) {
 		return Echo{}, err
 	}
 	recvAt := u.clk.Now()
+	downTOS := parseRecvTOS(u.oob[:oobn])
 	e, err := protocol.UnmarshalEcho(u.rbuf[:n])
 	if err != nil {
 		return Echo{}, err
 	}
 	return Echo{
-		Seq:          e.Seq,
-		SentAt:       time.Unix(0, e.TSendNanos),
-		RecvAt:       recvAt,
-		ServerRecvAt: time.Unix(0, e.TRecvServerNanos),
-		TOSObserved:  Marking(e.TOSObserved),
-		CESeen:       e.CE != 0,
+		Seq:             e.Seq,
+		SentAt:          time.Unix(0, e.TSendNanos),
+		RecvAt:          recvAt,
+		ServerRecvAt:    time.Unix(0, e.TRecvServerNanos),
+		TOSObserved:     Marking(e.TOSObserved),
+		CESeen:          e.CE != 0,
+		DownTOSObserved: Marking(downTOS),
+		DownCE:          downTOS&0x03 == 0x03,
 	}, nil
 }
 

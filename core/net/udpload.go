@@ -10,6 +10,7 @@ import (
 
 	"github.com/judwhiteneck/qoe-test-harness/core/clock"
 	"github.com/judwhiteneck/qoe-test-harness/core/protocol"
+	"golang.org/x/sys/unix"
 )
 
 // LoadPktSize is the on-wire size of each upstream load packet (header + padding).
@@ -149,6 +150,22 @@ func (l *UDPLoad) Stop() {
 func (l *UDPLoad) Close() error {
 	l.Stop()
 	return l.conn.Close()
+}
+
+// SetMarking sets the IP TOS (ECN+DSCP) on every packet this load flow sends,
+// so the load can congest the classic or the low-latency class on purpose.
+func (l *UDPLoad) SetMarking(m Marking) error {
+	rc, err := l.conn.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var serr error
+	if cerr := rc.Control(func(fd uintptr) {
+		serr = unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_TOS, int(m))
+	}); cerr != nil {
+		return cerr
+	}
+	return serr
 }
 
 var _ LoadController = (*UDPLoad)(nil)

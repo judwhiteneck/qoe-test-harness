@@ -14,6 +14,7 @@ import (
 	stdnet "net"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/judwhiteneck/qoe-test-harness/core/clock"
 	cnet "github.com/judwhiteneck/qoe-test-harness/core/net"
@@ -191,7 +192,7 @@ func (s *Server) onStart(b []byte, src *stdnet.UDPAddr) {
 	if dur <= 0 || dur > maxDownDurationMs*time.Millisecond {
 		dur = maxDownDurationMs * time.Millisecond
 	}
-	s.startDown(src, rate, dur)
+	s.startDown(src, rate, dur, st.Marking)
 }
 
 // onStop cancels the caller's downstream flow. It requires the same cookie so a
@@ -206,7 +207,7 @@ func (s *Server) onStop(h protocol.Header, b []byte, src *stdnet.UDPAddr) {
 	s.stopDown(src.String())
 }
 
-func (s *Server) startDown(src *stdnet.UDPAddr, rate uint64, dur time.Duration) {
+func (s *Server) startDown(src *stdnet.UDPAddr, rate uint64, dur time.Duration, marking uint8) {
 	key := src.String()
 	ctx, cancel := context.WithTimeout(context.Background(), dur)
 	df := &downFlow{cancel: cancel}
@@ -216,7 +217,7 @@ func (s *Server) startDown(src *stdnet.UDPAddr, rate uint64, dur time.Duration) 
 	}
 	s.downs[key] = df
 	s.dmu.Unlock()
-	go s.downLoop(ctx, key, df, src, rate)
+	go s.downLoop(ctx, key, df, src, rate, marking)
 }
 
 func (s *Server) stopDown(key string) {
@@ -232,7 +233,7 @@ func (s *Server) stopDown(key string) {
 // The flow is currently classic (unmarked): its job is to congest the bottleneck.
 // Setting ECT(1)/NQB on the downstream bytes is applied and verified on the wire
 // in M0/S2 on hardware; the carried Marking field reserves the format for it.
-func (s *Server) downLoop(ctx context.Context, key string, df *downFlow, src *stdnet.UDPAddr, rate uint64) {
+func (s *Server) downLoop(ctx context.Context, key string, df *downFlow, src *stdnet.UDPAddr, rate uint64, marking uint8) {
 	defer func() {
 		// Only retire the map entry if it is still ours; a newer flow may have
 		// replaced us for this source.
@@ -245,6 +246,10 @@ func (s *Server) downLoop(ctx context.Context, key string, df *downFlow, src *st
 	pacer := cnet.NewPacer(clock.System{}, downPktSize, rate)
 	buf := make([]byte, downPktSize)
 	_, _ = (protocol.Header{Type: protocol.MsgLoad}).Marshal(buf) // header prefix; rest padding
+	var oob []byte
+	if marking != 0 {
+		oob = tosOOB(int(marking))
+	}
 	ticker := time.NewTicker(downTick)
 	defer ticker.Stop()
 	for {
@@ -254,7 +259,13 @@ func (s *Server) downLoop(ctx context.Context, key string, df *downFlow, src *st
 		case <-ticker.C:
 			due := pacer.Due()
 			for i := 0; i < due; i++ {
-				if _, err := s.conn.WriteToUDP(buf, src); err != nil {
+				var werr error
+				if oob != nil {
+					_, _, werr = s.conn.WriteMsgUDP(buf, oob, src)
+				} else {
+					_, werr = s.conn.WriteToUDP(buf, src)
+				}
+				if werr != nil {
 					break
 				}
 			}
@@ -319,7 +330,10 @@ func (s *Server) echoProbe(b []byte, tos int, src *stdnet.UDPAddr) {
 	if _, err := echo.Marshal(out); err != nil {
 		return
 	}
-	_, _ = s.conn.WriteToUDP(out, src)
+	// Reflect the intended mark onto the RETURN (downstream) leg so the echo
+	// exercises downstream L4S treatment. Per-packet via cmsg so the shared
+	// socket's concurrent (classic) downstream load stays unmarked.
+	_, _, _ = s.conn.WriteMsgUDP(out, tosOOB(int(p.TOSIntended)), src)
 }
 
 // ceBit reports ECN Congestion-Experienced (the low two bits == 0b11).
@@ -328,4 +342,17 @@ func ceBit(tos int) uint8 {
 		return 1
 	}
 	return 0
+}
+
+// tosOOB builds an IP_TOS ancillary-data block so one WriteMsgUDP sets the TOS
+// byte on just that datagram (not the whole shared socket).
+func tosOOB(tos int) []byte {
+	const dataLen = 4
+	b := make([]byte, unix.CmsgSpace(dataLen))
+	h := (*unix.Cmsghdr)(unsafe.Pointer(&b[0]))
+	h.Level = unix.IPPROTO_IP
+	h.Type = unix.IP_TOS
+	h.SetLen(unix.CmsgLen(dataLen))
+	*(*uint32)(unsafe.Pointer(&b[unix.CmsgLen(0)])) = uint32(tos)
+	return b
 }

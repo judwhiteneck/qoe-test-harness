@@ -35,8 +35,16 @@ type Echo struct {
 	SentAt       time.Time // original client send time, echoed back (for per-probe RTT)
 	RecvAt       time.Time // client receive time (for RTT)
 	ServerRecvAt time.Time // server receive time (for relative one-way cross-check)
-	TOSObserved  Marking
-	CESeen       bool
+	TOSObserved  Marking   // server-observed TOS: marking survival on the client->server (upstream) leg
+	CESeen       bool      // CE observed by the server on the upstream probe
+
+	// DownTOSObserved is the TOS byte the CLIENT observed on the received echo,
+	// i.e. the server->client (downstream) leg, when the server reflects the mark
+	// onto the return path. DownCE is whether that echo arrived CE-marked (the
+	// direct signal that a downstream L4S AQM acted). Both are zero if the client
+	// socket could not read the received TOS.
+	DownTOSObserved Marking
+	DownCE          bool
 }
 
 // PacketConn is the marked-UDP transport seam. The real implementation wraps raw
