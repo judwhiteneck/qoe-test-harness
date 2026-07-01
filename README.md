@@ -91,6 +91,11 @@ architecture and required practices in [`docs/ARCHITECTURE.md`](docs/ARCHITECTUR
 [`docs/ENGINEERING.md`](docs/ENGINEERING.md). Deploying (VPS server + tester CLI,
 incl. Windows/WSL2): [`docs/DEPLOY.md`](docs/DEPLOY.md).
 
+Planned (specced, not built): passive real-QoE monitor that observes real
+gaming/VC/streaming sessions and correlates them with L4S marking —
+[`docs/qoe-passive-spec.md`](docs/qoe-passive-spec.md), built on a separate x86
+OpenWrt router platform [`docs/openwrt-router-spec.md`](docs/openwrt-router-spec.md).
+
 ## Build & run
 
 Requires Go (Linux for the socket layer). The measurement core and simulator are
